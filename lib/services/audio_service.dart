@@ -128,6 +128,10 @@ class AudioService extends ChangeNotifier {
       threads: 6, // 8 Gen 3: prime + 3 perf cores; 6 threads ≈ best throughput
       noContext: true, // don't let one bad window poison the next
       initialPrompt: MiningVocabulary.whisperInitialPrompt,
+      // Beam search trades CPU for accuracy; the VAD pass freed that
+      // headroom (noise windows no longer reach the decoder).
+      strategy: WhisperSamplingStrategy.beamSearch,
+      beamSize: 5,
       temperature: 0.0,
       noSpeechThreshold: 0.6,
       logProbabilityThreshold: -1.0,

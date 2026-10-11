@@ -347,7 +347,9 @@ class _ListenScreenState extends State<ListenScreen> {
                         !_audioService.modelLoaded) {
                       statusText = 'Loading speech model...';
                     } else if (_audioService.isListening) {
-                      statusText = 'Monitoring radio traffic...';
+                      statusText = _audioService.pipelineHint.isNotEmpty
+                          ? _audioService.pipelineHint
+                          : 'Monitoring radio traffic...';
                     } else {
                       statusText = 'Tap mic to start monitoring';
                     }

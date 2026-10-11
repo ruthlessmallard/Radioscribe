@@ -61,18 +61,19 @@ class AudioService extends ChangeNotifier {
   /// Seconds of silence that ends a segment.
   static const double _silenceCutSeconds = 1.2;
 
-  /// Maximum segment length (whisper works on ~30 s windows).
-  static const double _maxSegmentSeconds = 30.0;
+  /// Maximum segment length (whisper works on ~30 s windows; 20 s keeps
+  /// wait times reasonable on radio PTT bursts).
+  static const double _maxSegmentSeconds = 20.0;
 
   /// Minimum buffered speech before a segment is worth transcribing.
   static const double _minSegmentSeconds = 0.5;
 
-  /// Default speech-detection threshold (RMS) when the user's energy gate
-  /// setting is 0 (disabled).
-  static const double _defaultSpeechThreshold = 0.004;
+  /// Absolute floor for speech detection (RMS) — adaptive gate never goes
+  /// below this.
+  static const double _minSpeechRms = 0.0015;
 
   /// Speech-detection threshold. The existing energy-gate setting doubles as
-  /// the VAD threshold; 0 = use the field default.
+  /// a fixed VAD threshold; 0 = adaptive (noise-floor tracking).
   double _energyGateThreshold = 0.0;
 
   set energyGateThreshold(double value) {
@@ -81,8 +82,26 @@ class AudioService extends ChangeNotifier {
 
   double get energyGateThreshold => _energyGateThreshold;
 
-  double get _speechThreshold =>
-      _energyGateThreshold > 0 ? _energyGateThreshold : _defaultSpeechThreshold;
+  /// Running estimate of the ambient noise level (RMS). Speech is anything
+  /// clearly above it, so the gate self-tunes to whatever mic/environment.
+  double _noiseFloor = 0.0015;
+  int _chunkCount = 0;
+  String _lastHint = '';
+
+  double get _speechThreshold => _energyGateThreshold > 0
+      ? _energyGateThreshold
+      : math.max(_minSpeechRms, _noiseFloor * 3.0);
+
+  /// Human-visible pipeline stage, shown on the Listen screen status line:
+  /// listening → speech buffered → transcribing. Lets a field user (or us)
+  /// see exactly where the pipeline is or stuck.
+  String get pipelineHint {
+    if (_modelError) return '';
+    if (_pendingTranscriptions > 0) return 'Transcribing...';
+    if (_hasSpeech) return 'Speech detected — buffering...';
+    if (_isListening && _modelLoaded) return 'Listening for speech...';
+    return '';
+  }
 
   /// Transcription configuration: English radio traffic, biased toward the
   /// mining vocabulary, with hallucination guards tuned for noise.
@@ -249,10 +268,19 @@ class AudioService extends ChangeNotifier {
       samplesFloat32 = _applyBandpassFilter(samplesFloat32);
 
       final duration = samplesFloat32.length / _sampleRate;
-      final isSpeech = _isEnergyAboveThreshold(
-        samplesFloat32,
-        _speechThreshold,
-      );
+      final rms = _rms(samplesFloat32);
+      _updateNoiseFloor(rms);
+      final threshold = _speechThreshold;
+      final isSpeech = rms >= threshold;
+
+      // Periodic pipeline telemetry — visible via adb logcat / flutter logs.
+      _chunkCount++;
+      if (_chunkCount % 16 == 0) {
+        debugPrint('[AudioService] rms=${rms.toStringAsFixed(5)} '
+            'floor=${_noiseFloor.toStringAsFixed(5)} '
+            'thr=${threshold.toStringAsFixed(5)} '
+            'speech=$_hasSpeech buf=${(_bufferSamples / _sampleRate).toStringAsFixed(1)}s');
+      }
 
       // Buffer from the moment speech starts (including trailing silence so
       // the model hears natural pauses), until the cut or cap is reached.
@@ -272,8 +300,14 @@ class AudioService extends ChangeNotifier {
             (_silenceSeconds >= _silenceCutSeconds ||
                 bufferedSeconds >= _maxSegmentSeconds)) {
           _flushSegment();
-          notifyListeners();
         }
+      }
+
+      // Push stage changes to the UI status line.
+      final hint = pipelineHint;
+      if (hint != _lastHint) {
+        _lastHint = hint;
+        notifyListeners();
       }
     } catch (e) {
       debugPrint('[AudioService] Audio processing error: $e');
@@ -317,6 +351,7 @@ class AudioService extends ChangeNotifier {
       _partialText = '…'; // in-flight indicator
       notifyListeners();
     }
+    final sw = Stopwatch()..start();
 
     try {
       // The plugin serializes concurrent transcriptions internally.
@@ -324,18 +359,30 @@ class AudioService extends ChangeNotifier {
         samples,
         config: _transcribeConfig,
       );
+      sw.stop();
       final text = result.text.trim();
       if (text.isNotEmpty) {
+        debugPrint('[AudioService] segment ${sw.elapsedMilliseconds}ms '
+            '(${samples.length / _sampleRate}s audio): $text');
         _segmentController.add(text);
+      } else {
+        debugPrint('[AudioService] segment ${sw.elapsedMilliseconds}ms: '
+            'empty result');
       }
     } catch (e) {
-      debugPrint('[AudioService] Transcription failed: $e');
+      sw.stop();
+      debugPrint('[AudioService] Transcription failed after '
+          '${sw.elapsedMilliseconds}ms: $e');
     } finally {
       _pendingTranscriptions--;
       if (_pendingTranscriptions == 0 && _partialText.isNotEmpty) {
         _partialText = '';
-        notifyListeners();
       }
+      final hint = pipelineHint;
+      if (hint != _lastHint) {
+        _lastHint = hint;
+      }
+      notifyListeners();
     }
   }
 
@@ -400,14 +447,23 @@ class AudioService extends ChangeNotifier {
   }
 
   /// Check if frame energy (RMS) is above the speech threshold.
-  bool _isEnergyAboveThreshold(Float32List samples, double threshold) {
-    if (samples.isEmpty) return false;
+  double _rms(Float32List samples) {
+    if (samples.isEmpty) return 0.0;
     double sumSquares = 0.0;
     for (final s in samples) {
       sumSquares += s * s;
     }
-    final rms = math.sqrt(sumSquares / samples.length);
-    return rms >= threshold;
+    return math.sqrt(sumSquares / samples.length);
+  }
+
+  /// Track ambient noise level: falls fast toward quiet, rises slowly so
+  /// speech peaks don't drag it up. The gate is always relative to this.
+  void _updateNoiseFloor(double rms) {
+    if (rms < _noiseFloor) {
+      _noiseFloor = 0.9 * _noiseFloor + 0.1 * rms;
+    } else {
+      _noiseFloor = 0.995 * _noiseFloor + 0.005 * rms;
+    }
   }
 
   // ── Dispose ───────────────────────────────────────────────────────────────

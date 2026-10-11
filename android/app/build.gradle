@@ -34,6 +34,12 @@ android {
             shrinkResources false
         }
     }
+
+    // Keep the bundled whisper GGML model uncompressed in the APK so it can
+    // be streamed out via AssetFileDescriptor without a decompress pass.
+    androidResources {
+        noCompress 'bin'
+    }
 }
 
 flutter {

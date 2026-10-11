@@ -322,6 +322,16 @@ class MiningVocabulary {
     return false;
   }
 
+  /// High-importance mining terms as a Whisper initial prompt.
+  /// Conditions the decoder toward mining vocabulary (replaces the old
+  /// Sherpa hotword boosting). Prompt stays well under the ~224 token limit.
+  static String get whisperInitialPrompt {
+    return hotwords.entries
+        .where((e) => e.value >= 8.0)
+        .map((e) => e.key)
+        .join(', ');
+  }
+
   /// Get hotwords formatted for Sherpa ONNX config.
   /// Returns list of "word:score" strings.
   static List<String> getHotwordsList() {

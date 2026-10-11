@@ -64,6 +64,19 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: android/app/src/main/assets/models
+          key: whisper-ggml-large-v3-turbo-fp16-v1
+
+      - name: Download Whisper large-v3-turbo (fp16) model
+        run: |
+          mkdir -p android/app/src/main/assets/models
+          curl -sL --fail --retry 3 -o android/app/src/main/assets/models/ggml-large-v3-turbo.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
+          ls -l android/app/src/main/assets/models
+
       - name: Build release APK
         run: flutter build apk --release
 

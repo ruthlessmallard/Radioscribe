@@ -51,8 +51,10 @@ class AudioService extends ChangeNotifier {
   static const int _sampleRate = 16000;
 
   /// Bundled model asset inside the APK (android/app/src/main/assets).
-  static const String _modelAssetPath = 'models/ggml-large-v3-turbo.bin';
-  static const String _modelFileName = 'ggml-large-v3-turbo.bin';
+  /// q8_0 quantization: near-fp16 accuracy, but int8 uses ARM's fast dot
+  /// products — fp16/fp32 on a phone CPU is 2-3x slower.
+  static const String _modelAssetPath = 'models/ggml-large-v3-turbo-q8_0.bin';
+  static const String _modelFileName = 'ggml-large-v3-turbo-q8_0.bin';
 
   /// Platform channel used to stream the model asset to disk without
   /// loading it into Dart memory. Implemented in MainActivity.
@@ -61,9 +63,10 @@ class AudioService extends ChangeNotifier {
   /// Seconds of silence that ends a segment.
   static const double _silenceCutSeconds = 1.2;
 
-  /// Maximum segment length (whisper works on ~30 s windows; 20 s keeps
-  /// wait times reasonable on radio PTT bursts).
-  static const double _maxSegmentSeconds = 20.0;
+  /// Maximum segment length. Shorter windows = lower transcription latency
+  /// and smaller backlog when the engine is the bottleneck. Radio PTT bursts
+  /// are rarely longer than this.
+  static const double _maxSegmentSeconds = 15.0;
 
   /// Minimum buffered speech before a segment is worth transcribing.
   static const double _minSegmentSeconds = 0.5;
@@ -97,7 +100,11 @@ class AudioService extends ChangeNotifier {
   /// see exactly where the pipeline is or stuck.
   String get pipelineHint {
     if (_modelError) return '';
-    if (_pendingTranscriptions > 0) return 'Transcribing...';
+    if (_pendingTranscriptions > 0) {
+      return _pendingTranscriptions > 1
+          ? 'Transcribing... ($_pendingTranscriptions queued)'
+          : 'Transcribing...';
+    }
     if (_hasSpeech) return 'Speech detected — buffering...';
     if (_isListening && _modelLoaded) return 'Listening for speech...';
     return '';
@@ -107,7 +114,7 @@ class AudioService extends ChangeNotifier {
   /// mining vocabulary, with hallucination guards tuned for noise.
   final WhisperTranscribeConfig _transcribeConfig = WhisperTranscribeConfig(
     language: 'en',
-    threads: 4,
+    threads: 6, // 8 Gen 3: prime + 3 perf cores; 6 threads ≈ best throughput
     noContext: true, // don't let one bad window poison the next
     initialPrompt: MiningVocabulary.whisperInitialPrompt,
     temperature: 0.0,

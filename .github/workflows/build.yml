@@ -64,18 +64,22 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Cache Whisper model
+      - name: Cache models
         uses: actions/cache@v4
         with:
-          path: android/app/src/main/assets/models
-          key: whisper-ggml-large-v3-turbo-q8_0-v1
+          path: |
+            android/app/src/main/assets/models
+            assets/models
+          key: whisper-models-q8_0-silero-v1
 
-      - name: Download Whisper large-v3-turbo (q8_0) model
+      - name: Download Whisper (q8_0) + Silero VAD models
         run: |
-          mkdir -p android/app/src/main/assets/models
+          mkdir -p android/app/src/main/assets/models assets/models
           curl -sL --fail --retry 3 -o android/app/src/main/assets/models/ggml-large-v3-turbo-q8_0.bin \
             https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin
-          ls -l android/app/src/main/assets/models
+          curl -sL --fail --retry 3 -o assets/models/ggml-silero-v5.1.2.bin \
+            https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+          ls -l android/app/src/main/assets/models assets/models
 
       - name: Build release APK
         run: flutter build apk --release

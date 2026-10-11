@@ -75,6 +75,14 @@ class AudioService extends ChangeNotifier {
   /// below this.
   static const double _minSpeechRms = 0.0015;
 
+  /// Speech must sustain this long before the gate commits to a window
+  /// (kills one-chunk noise blips).
+  static const double _minOnsetSeconds = 0.3;
+
+  /// A window must contain at least this fraction of speech to be worth
+  /// transcribing — mostly-noise windows are skipped outright.
+  static const double _minSpeechFraction = 0.15;
+
   /// Speech-detection threshold. The existing energy-gate setting doubles as
   /// a fixed VAD threshold; 0 = adaptive (noise-floor tracking).
   double _energyGateThreshold = 0.0;
@@ -112,15 +120,20 @@ class AudioService extends ChangeNotifier {
 
   /// Transcription configuration: English radio traffic, biased toward the
   /// mining vocabulary, with hallucination guards tuned for noise.
-  final WhisperTranscribeConfig _transcribeConfig = WhisperTranscribeConfig(
-    language: 'en',
-    threads: 6, // 8 Gen 3: prime + 3 perf cores; 6 threads ≈ best throughput
-    noContext: true, // don't let one bad window poison the next
-    initialPrompt: MiningVocabulary.whisperInitialPrompt,
-    temperature: 0.0,
-    noSpeechThreshold: 0.6,
-    logProbabilityThreshold: -1.0,
-  );
+  /// [WhisperVadConfig] (Silero) is attached in [_buildTranscribeConfig] so
+  /// whisper only transcribes actual speech regions.
+  WhisperTranscribeConfig _buildTranscribeConfig() {
+    return WhisperTranscribeConfig(
+      language: 'en',
+      threads: 6, // 8 Gen 3: prime + 3 perf cores; 6 threads ≈ best throughput
+      noContext: true, // don't let one bad window poison the next
+      initialPrompt: MiningVocabulary.whisperInitialPrompt,
+      temperature: 0.0,
+      noSpeechThreshold: 0.6,
+      logProbabilityThreshold: -1.0,
+      vad: _vadConfig,
+    );
+  }
 
   // ── Internals ─────────────────────────────────────────────────────────────
   final StreamController<String> _segmentController =
@@ -138,6 +151,13 @@ class AudioService extends ChangeNotifier {
   bool _hasSpeech = false;
   double _silenceSeconds = 0.0;
   int _pendingTranscriptions = 0;
+
+  // Gate hardening: speech must sustain for a moment before we commit to a
+  // window (kills one-chunk noise blips), and a window must be mostly speech
+  // to be worth transcribing (kills noise-heavy phantom transcripts).
+  double _onsetSeconds = 0.0;
+  double _speechSeconds = 0.0;
+  WhisperVadConfig? _vadConfig;
 
   // Bandpass filter state (biquad cascade: high-pass @ 300Hz, low-pass @ 3400Hz)
   double _hpX1 = 0, _hpX2 = 0, _hpY1 = 0, _hpY2 = 0;
@@ -171,6 +191,33 @@ class AudioService extends ChangeNotifier {
     return path;
   }
 
+  /// Extracts the tiny Silero VAD model (~885 kB) from Flutter assets into
+  /// app storage and builds its config. Small enough for rootBundle, unlike
+  /// the STT model.
+  Future<WhisperVadConfig> _ensureVadModel() async {
+    const assetPath = 'assets/models/ggml-silero-v5.1.2.bin';
+    final support = await getApplicationSupportDirectory();
+    final dest = File(p.join(support.path, 'ggml-silero-v5.1.2.bin'));
+    if (!await dest.exists() || await dest.length() < 500 * 1024) {
+      final data = await rootBundle.load(assetPath);
+      await dest.parent.create(recursive: true);
+      final tmp = File('${dest.path}.part');
+      await tmp.writeAsBytes(
+          data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes));
+      await tmp.rename(dest.path);
+    }
+    return WhisperVadConfig(
+      modelPath: dest.path,
+      // Radio voice: slightly lenient threshold, moderate silence split so
+      // PTT bursts stay whole, window cap matches our segment cap.
+      threshold: 0.45,
+      minimumSpeechDuration: const Duration(milliseconds: 200),
+      minimumSilenceDuration: const Duration(milliseconds: 400),
+      maximumSpeechDuration: const Duration(seconds: 15),
+      speechPadding: const Duration(milliseconds: 60),
+    );
+  }
+
   Future<void> _ensureModelLoaded() async {
     if (_modelLoaded || _modelError) return;
     try {
@@ -184,6 +231,15 @@ class AudioService extends ChangeNotifier {
         onModelProgress: (progress) =>
             debugPrint('[AudioService] model load $progress%'),
       );
+
+      // Silero VAD model is tiny (~885 kB) — non-fatal if it fails; the
+      // energy gate + segment filters still apply.
+      try {
+        _vadConfig = await _ensureVadModel();
+        debugPrint('[AudioService] Silero VAD loaded.');
+      } catch (e) {
+        debugPrint('[AudioService] VAD model unavailable: $e');
+      }
 
       _modelLoaded = true;
       debugPrint('[AudioService] whisper.cpp model loaded.');
@@ -279,7 +335,6 @@ class AudioService extends ChangeNotifier {
       _updateNoiseFloor(rms);
       final threshold = _speechThreshold;
       final isSpeech = rms >= threshold;
-
       // Periodic pipeline telemetry — visible via adb logcat / flutter logs.
       _chunkCount++;
       if (_chunkCount % 16 == 0) {
@@ -291,23 +346,33 @@ class AudioService extends ChangeNotifier {
 
       // Buffer from the moment speech starts (including trailing silence so
       // the model hears natural pauses), until the cut or cap is reached.
-      if (isSpeech || _hasSpeech) {
+      // Onset gating: a lone noise blip never commits to a window.
+      if (isSpeech) {
         _bufferChunks.add(samplesFloat32);
         _bufferSamples += samplesFloat32.length;
-
-        if (isSpeech) {
+        _speechSeconds += duration;
+        _onsetSeconds += duration;
+        if (!_hasSpeech && _onsetSeconds >= _minOnsetSeconds) {
           _hasSpeech = true;
+        }
+        if (_hasSpeech) {
           _silenceSeconds = 0;
-        } else if (_hasSpeech) {
-          _silenceSeconds += duration;
         }
+      } else if (_hasSpeech) {
+        _bufferChunks.add(samplesFloat32);
+        _bufferSamples += samplesFloat32.length;
+        _silenceSeconds += duration;
+      } else if (_onsetSeconds > 0) {
+        // Speech never sustained past the onset gate — noise blip, discard.
+        _onsetSeconds = 0;
+        _clearBuffer();
+      }
 
-        final bufferedSeconds = _bufferSamples / _sampleRate;
-        if (_hasSpeech &&
-            (_silenceSeconds >= _silenceCutSeconds ||
-                bufferedSeconds >= _maxSegmentSeconds)) {
-          _flushSegment();
-        }
+      final bufferedSeconds = _bufferSamples / _sampleRate;
+      if (_hasSpeech &&
+          (_silenceSeconds >= _silenceCutSeconds ||
+              bufferedSeconds >= _maxSegmentSeconds)) {
+        _flushSegment();
       }
 
       // Push stage changes to the UI status line.
@@ -331,6 +396,16 @@ class AudioService extends ChangeNotifier {
       return;
     }
 
+    // Mostly-noise windows don't get transcribed — whisper hallucinates on
+    // them, and they waste engine time while the queue climbs.
+    final speechFraction = seconds > 0 ? _speechSeconds / seconds : 0.0;
+    if (speechFraction < _minSpeechFraction) {
+      debugPrint('[AudioService] dropping window: '
+          '${(speechFraction * 100).toStringAsFixed(0)}% speech, skipped.');
+      _clearBuffer();
+      return;
+    }
+
     final samples = Float32List(_bufferSamples);
     var offset = 0;
     for (final chunk in _bufferChunks) {
@@ -347,6 +422,8 @@ class AudioService extends ChangeNotifier {
     _bufferSamples = 0;
     _hasSpeech = false;
     _silenceSeconds = 0;
+    _onsetSeconds = 0;
+    _speechSeconds = 0;
   }
 
   Future<void> _transcribeSegment(Float32List samples) async {
@@ -364,17 +441,28 @@ class AudioService extends ChangeNotifier {
       // The plugin serializes concurrent transcriptions internally.
       final result = await whisper.transcribe(
         samples,
-        config: _transcribeConfig,
+        config: _buildTranscribeConfig(),
       );
       sw.stop();
-      final text = result.text.trim();
+      // Drop low-confidence segments — whisper invents plausible text on
+      // noise, and noSpeechProbability is how it flags its own doubt.
+      final dropped = result.segments
+          .where((s) => s.noSpeechProbability > 0.8)
+          .length;
+      final text = result.segments
+          .where((s) => s.noSpeechProbability <= 0.8)
+          .map((s) => s.text.trim())
+          .where((t) => t.isNotEmpty)
+          .join(' ')
+          .trim();
       if (text.isNotEmpty) {
         debugPrint('[AudioService] segment ${sw.elapsedMilliseconds}ms '
-            '(${samples.length / _sampleRate}s audio): $text');
+            '(${samples.length / _sampleRate}s audio, dropped $dropped): '
+            '$text');
         _segmentController.add(text);
       } else {
         debugPrint('[AudioService] segment ${sw.elapsedMilliseconds}ms: '
-            'empty result');
+            'empty/filtered result ($dropped dropped)');
       }
     } catch (e) {
       sw.stop();

@@ -8,7 +8,7 @@ Underground mine radio traffic monitor with offline speech-to-text and keyword a
 
 ## Overview
 
-RadioScribe monitors radio traffic through your phone's microphone, transcribes speech offline using Vosk, and alerts you when critical keywords are detected. Built for underground mining environments.
+RadioScribe monitors radio traffic through your phone's microphone, transcribes speech offline, and alerts you when critical keywords are detected. Built for underground mining environments.
 
 ## Alert Tiers
 
@@ -18,30 +18,13 @@ RadioScribe monitors radio traffic through your phone's microphone, transcribes 
 | Warning | Keyword match | industrial Yellow | Pinned, swipe to dismiss |
 | Safety | Safety keyword | tool handle Red | Pinned top, alarm after 20s |
 
-## Setup Before Building
-
-### 1. Vosk Model
-Download the small English model from https://alphacephei.com/vosk/models
-
-- Recommended: `vosk-model-small-en-us-0.15`
-- Extract into `assets/models/vosk-model-small-en-us-0.15/`
-
-### 2. Alarm Sound
-Place an `alarm.mp3` file in `assets/sounds/`
-
-### 3. Build
-```bash
-flutter pub get
-flutter build apk --release
-```
-
 ## Architecture
 
 ```
 lib/
   main.dart               # App entry point
   theme/
-    app_theme.dart        # Colors (CAT yellow, Snap-on red, dark bg)
+    app_theme.dart        # Colors (industrial yellow, tool red, dark bg)
   models/
     segment.dart          # TranscriptSegment data model
     keyword_config.dart   # Keyword lists + settings model
@@ -58,15 +41,6 @@ lib/
   widgets/
     segment_card.dart     # Swipeable segment display card
 ```
-
-## Vosk Integration (TODO)
-
-The `AudioService` in `lib/services/audio_service.dart` has a `_simulateRecognition()` placeholder. Replace with real Vosk calls:
-
-1. Load model: `VoskFlutterPlugin.instance().initModel('assets/models/vosk-model-small-en-us-0.15')`
-2. Start recognizer with silence threshold from `KeywordConfig.silenceThresholdMs`
-3. On partial result: update `_partialText`
-4. On final result: push to `_segmentController`
 
 ## License
 

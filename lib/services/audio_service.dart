@@ -128,14 +128,18 @@ class AudioService extends ChangeNotifier {
       threads: 6, // 8 Gen 3: prime + 3 perf cores; 6 threads ≈ best throughput
       noContext: true, // don't let one bad window poison the next
       initialPrompt: MiningVocabulary.whisperInitialPrompt,
-      // Beam search trades CPU for accuracy; the VAD pass freed that
-      // headroom (noise windows no longer reach the decoder).
-      strategy: WhisperSamplingStrategy.beamSearch,
-      beamSize: 5,
+      // Beam search: reverted. Field test with VAD+beam showed worse
+      // accuracy and dropped speech — bisecting the regression, greedy
+      // first (the config he rated best), then one variable at a time.
       temperature: 0.0,
       noSpeechThreshold: 0.6,
       logProbabilityThreshold: -1.0,
-      vad: _vadConfig,
+      // Silero VAD: disabled while bisecting. The field report says this
+      // build ignored real speech and garbled the rest — VAD slicing on
+      // radio-band audio is the prime suspect. Keeping the cheap filters
+      // (onset gate, speech fraction, noSpeechProbability) that only
+      // remove noise windows, not speech.
+      // vad: _vadConfig,
     );
   }
 
@@ -240,7 +244,8 @@ class AudioService extends ChangeNotifier {
       // energy gate + segment filters still apply.
       try {
         _vadConfig = await _ensureVadModel();
-        debugPrint('[AudioService] Silero VAD loaded.');
+        debugPrint('[AudioService] Silero VAD loaded '
+            '(currently disabled in decode config: ${_vadConfig != null}).');
       } catch (e) {
         debugPrint('[AudioService] VAD model unavailable: $e');
       }
